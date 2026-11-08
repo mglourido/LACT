@@ -11,7 +11,7 @@ use crate::{
     config::Config,
     server::{
         ClientContext,
-        gpu_controller::{build_controller_info, init_controller},
+        gpu_controller::{build_controller_info, init_controller, parse_uevent},
         profiles,
         system::DAEMON_VERSION,
     },
@@ -38,7 +38,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     fs::{self, File, Permissions},
     io::{BufWriter, Cursor, Write},
@@ -117,7 +117,7 @@ pub struct Handler {
 impl<'a> Handler {
     pub async fn new(config: Config) -> anyhow::Result<Self> {
         let base_path = drm_base_path();
-        let pci_db = read_pci_db();
+        let pci_db = read_pci_db_for(&base_path);
 
         Self::with_base_path(&base_path, config, &pci_db).await
     }
@@ -229,7 +229,7 @@ impl<'a> Handler {
         tokio::task::spawn_local(handle_reload_events(handler.clone(), reload_rx));
 
         // Eagerly release memory
-        // `load_controllers` allocates and deallocates the entire PCI ID database,
+        // Reading the PCI ID database and initializing the controllers allocates and deallocates a lot of temporary memory,
         // this tells the os to release it right away, lowering measured memory usage (the actual usage is low regardless as it was already deallocated)
         #[cfg(target_env = "gnu")]
         unsafe {
@@ -255,7 +255,7 @@ impl<'a> Handler {
         let detached_ids = self.ignored_gpu_ids.read().await;
 
         let base_path = drm_base_path();
-        let pci_db = read_pci_db();
+        let pci_db = read_pci_db_for(&base_path);
         match load_controllers(&base_path, &pci_db, &detached_ids, &config) {
             Ok(new_controllers) => {
                 info!(
@@ -1353,23 +1353,129 @@ pub(crate) fn read_pci_db() -> Database {
     Database::parse_db(std::io::Cursor::new(bytes)).unwrap()
 }
 
+/// Reads the PCI ID database, keeping only the vendors used by the GPUs found in `base_path`.
 #[cfg(not(test))]
-pub(crate) fn read_pci_db() -> Database {
-    let result = if let Some(db_path) = env::var("LACT_PCI_DB_PATH")
+pub(crate) fn read_pci_db_for(base_path: &Path) -> Database {
+    // Same lookup paths as `pciid_parser`, which does not expose them.
+    // `@hwdata@` is a placeholder meant to be substituted by Nix packaging.
+    const DB_PATHS: &[&str] = &[
+        "/usr/share/hwdata/pci.ids",
+        "/usr/share/misc/pci.ids",
+        "/run/current-system/sw/share/pci.ids", // NixOS
+        "@hwdata@/share/hwdata/pci.ids",
+    ];
+
+    let db_path = env::var("LACT_PCI_DB_PATH")
         .ok()
         .filter(|value| !value.is_empty())
-    {
-        Database::read_from_file(db_path)
-    } else {
-        Database::read()
-    };
+        .map(PathBuf::from)
+        .or_else(|| {
+            DB_PATHS
+                .iter()
+                .map(PathBuf::from)
+                .find(|path| path.exists())
+        });
+
+    let result = db_path
+        .context("no PCI ID database file found")
+        .and_then(|path| {
+            let file = File::open(&path)
+                .with_context(|| format!("could not open '{}'", path.display()))?;
+            let reader = std::io::BufReader::new(file);
+
+            let vendor_ids = pci_vendor_ids(base_path);
+            let db = if vendor_ids.is_empty() {
+                // No GPUs are visible yet, but they may still appear during the controller load retries
+                debug!("no GPU PCI vendors found, reading the full PCI ID database");
+                Database::parse_db(reader)?
+            } else {
+                Database::parse_db(Cursor::new(filter_pci_ids(reader, &vendor_ids)?))?
+            };
+            Ok(db)
+        });
+
     result.unwrap_or_else(|err| {
-        warn!("could not read PCI ID database: {err}, device information will be limited");
+        warn!("could not read PCI ID database: {err:#}, device information will be limited");
         Database {
             vendors: HashMap::new(),
             classes: HashMap::new(),
         }
     })
+}
+
+// Tests use a fixed, unfiltered database so
+// snapshots don't depend on the host's pci.ids or sysfs
+#[cfg(test)]
+pub(crate) fn read_pci_db_for(_base_path: &Path) -> Database {
+    read_pci_db()
+}
+
+/// Whether a DRM entry name is a GPU card (`cardN`), and not one of its connectors (`cardN-DP-1`).
+fn is_drm_card(name: &str) -> bool {
+    name.starts_with("card") && !name.contains('-')
+}
+
+/// Vendor and subsystem vendor IDs of all the GPUs in `base_path`.
+pub(crate) fn pci_vendor_ids(base_path: &Path) -> HashSet<u16> {
+    let Ok(entries) = base_path.read_dir() else {
+        return HashSet::new();
+    };
+
+    entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_str().is_some_and(is_drm_card))
+        .filter_map(|entry| fs::read_to_string(entry.path().join("device/uevent")).ok())
+        .flat_map(|uevent| {
+            let uevent_map = parse_uevent(&uevent);
+            ["PCI_ID", "PCI_SUBSYS_ID"]
+                .into_iter()
+                .filter_map(|key| {
+                    let (vendor, _) = uevent_map.get(key)?.split_once(':')?;
+                    u16::from_str_radix(vendor, 16).ok()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Extracts only the sections of `pci.ids` that belong to the given vendors, without loading the whole file.
+pub(crate) fn filter_pci_ids(
+    mut reader: impl std::io::BufRead,
+    vendor_ids: &HashSet<u16>,
+) -> std::io::Result<String> {
+    let mut output = String::new();
+    let mut line = String::new();
+    let mut keep = false;
+
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+
+        if line.starts_with('\t') {
+            if keep {
+                output.push_str(&line);
+            }
+        } else if line.starts_with("C ") {
+            // Device classes come after all of the vendors
+            break;
+        } else {
+            keep = line
+                .get(..4)
+                .and_then(|id| u16::from_str_radix(id, 16).ok())
+                .is_some_and(|id| vendor_ids.contains(&id));
+            if keep {
+                output.push_str(&line);
+            }
+        }
+    }
+
+    Ok(output)
 }
 
 pub(crate) static AMD_DRM: LazyLock<Option<LibDrmAmdgpu>> = LazyLock::new(|| {
@@ -1423,7 +1529,7 @@ fn load_controllers(
             .file_name()
             .into_string()
             .map_err(|_| anyhow!("non-utf path"))?;
-        if name.starts_with("card") && !name.contains('-') {
+        if is_drm_card(&name) {
             trace!("trying gpu controller at {:?}", entry.path());
             let device_path = entry.path().join("device");
 

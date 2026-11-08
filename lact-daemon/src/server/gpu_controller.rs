@@ -356,7 +356,7 @@ pub(crate) fn init_controller(
     ))
 }
 
-fn parse_uevent(data: &str) -> HashMap<&str, &str> {
+pub(crate) fn parse_uevent(data: &str) -> HashMap<&str, &str> {
     data.lines()
         .filter_map(|line| line.split_once('='))
         .collect()
